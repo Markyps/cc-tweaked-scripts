@@ -1,20 +1,18 @@
--- Spatial Hub v2. All endpoints AND the dispatcher must use v2 together.
+-- Spatial Hub v2.1. One shared cell for every endpoint. Update the dispatcher too.
 -- Edit this block for EACH endpoint. See README_RU.md before the first run.
 local CFG = {
   CONFIGURED = false,
   HUB_ID = "earth", HUB_LABEL = "Earth Hub",
   DISPATCHER_ID = -1, -- Computer ID printed on the dispatcher computer (NOT HUB_ID).
-  NETWORK = "spatial_main", POOL = "shared_cell_1",
-  DIMENSION = "minecraft:overworld", SPATIAL_DIMENSION = "ae2:spatial_storage",
-  ZONE_MIN = {x=363, y=66, z=-4006}, ZONE_MAX = {x=366, y=69, z=-4003},
+  NETWORK = "spatial_main",
+  ZONE_CENTER = {x=364, y=67, z=-4005}, -- Coordinates of the central BLOCK.
+  ZONE_RADIUS = 1, -- 0 = 1x1x1, 1 = 3x3x3, 2 = 5x5x5.
   CELL = "ae2:spatial_storage_cell_16",
   PORT_NAME = "", VAULT_NAME = "", RELAY_NAME = "", DETECTOR_NAME = "", MONITOR_NAME = "",
-  RELAY_SIDE = "back", -- ONLY the side connected to THIS spatial port. Never all six sides.
-  MANAGER_SIDE = "up", -- Vault direction relative to each player's Inventory Manager.
   PULSE_SECONDS = 0.2,
   STATE = "spatial_hub_v2_state", LOG = "spatial_hub_v2.log",
 }
-local PROTOCOL = "spatial_hub_v2"
+local PROTOCOL = "spatial_hub_v2_1"
 
 
 -- Shared helpers are embedded in both deliverables; no extra library is required.
@@ -98,6 +96,28 @@ local function legacyGuard(path, hub)
   check(hub and v.phase == "IDLE" or not hub and not v.locked,
     "Unfinished v1 operation in " .. path .. ". Recover the player/cell with v1 before migration.")
 end
+local function upgradeHubState(state, network, hub, dispatcher)
+  local identity = network .. ":" .. hub .. ":" .. dispatcher
+  if not state then return identity end
+  if state.layout == "single_cell_zone_v1" then
+    check(state.identity == identity, "Endpoint identity changed; restore original settings")
+  else
+    local prefix, suffix = network .. ":", ":" .. hub .. ":" .. dispatcher
+    local old = state.identity or ""
+    check(old == identity or (old:sub(1,#prefix) == prefix and old:sub(-#suffix) == suffix), "Endpoint identity changed")
+    check(not state.active and not state.request, "Finish the v2 operation before upgrading to v2.1")
+    for _, j in pairs(state.ops or {}) do check(j.closed, "Unfinished v2 endpoint operation") end
+  end
+  return identity
+end
+local function upgradeDispatcherState(state)
+  if state and state.layout ~= "single_cell_zone_v1" then
+    for _, t in pairs(state.ops or {}) do
+      check(t.phase == "CLOSED", "Finish all v2 operations before upgrading to v2.1")
+      t.pool = nil -- Retire the old journal field only after the operation has ended.
+    end
+  end
+end
 
 
 local Hub = {}; Hub.__index = Hub
@@ -134,7 +154,7 @@ function Hub:control(m)
 end
 function Hub:command(m)
   if type(m.op) ~= "string" or type(m.action) ~= "string" or type(m.player) ~= "string" then return end
-  if m.pool ~= self.io.pool or not contains({m.src, m.dst, m.holder}, self.io.id) then return end
+  if not contains({m.src, m.dst, m.holder}, self.io.id) then return end
   local j = self.s.ops[m.op]
   local sequence = tonumber(m.op:match(":(%d+)$"))
   if not sequence then return end
@@ -238,6 +258,17 @@ end
 local function hardware(cfg, log)
   local H = {}
   local sides = {left=true,right=true,top=true,bottom=true,front=true,back=true}
+  local pulseSides = {"top","bottom","left","right","front","back"}
+  local r, center = cfg.ZONE_RADIUS, cfg.ZONE_CENTER
+  check(type(r) == "number" and r >= 0 and r == math.floor(r), "ZONE_RADIUS must be a non-negative integer")
+  check(type(center) == "table", "Set ZONE_CENTER={x=...,y=...,z=...}")
+  local minimum, maximum = {}, {}
+  for _, axis in ipairs({"x","y","z"}) do
+    local v = center[axis]
+    check(type(v) == "number" and v == math.floor(v), "ZONE_CENTER must contain integer block coordinates")
+    -- AP uses half-open bounds: [min, max). Include all 2*r+1 BLOCKS.
+    minimum[axis], maximum[axis] = v-r, v+r+1
+  end
   local function methods(name, list)
     if not peripheral.isPresent(name) then return false end
     local have = {}; for _, x in ipairs(peripheral.getMethods(name) or {}) do have[x] = true end
@@ -262,14 +293,22 @@ local function hardware(cfg, log)
   local vaultName = find(cfg.VAULT_NAME, {"list","pushItems"}, "item_vault")
   check(portName ~= vaultName, "Port and vault must be different inventories")
   local relayName = find(cfg.RELAY_NAME, {"setOutput","getOutput"})
-  local detectorName = find(cfg.DETECTOR_NAME, {"getPlayersInCoords","getPlayerPos"})
+  local detectorName = find(cfg.DETECTOR_NAME, {"getPlayersInCoords"})
   local monitorName = find(cfg.MONITOR_NAME, {"getSize","write","setCursorPos","clear"})
-  check(sides[cfg.RELAY_SIDE], "RELAY_SIDE must be one of the six CC sides")
   local port, vault = peripheral.wrap(portName), peripheral.wrap(vaultName)
   local relay, detector = peripheral.wrap(relayName), peripheral.wrap(detectorName)
   H.monitor, H.monitorName = peripheral.wrap(monitorName), monitorName
   H.names = {port=portName,vault=vaultName,relay=relayName,detector=detectorName,monitor=monitorName}
-  function H.low() relay.setOutput(cfg.RELAY_SIDE, false) end
+  local function outputs(value)
+    local errors = {}
+    for _, side in ipairs(pulseSides) do
+      local ok, err = pcall(relay.setOutput, side, value)
+      if not ok then errors[#errors+1] = side .. ": " .. tostring(err) end
+    end
+    -- Try EVERY side even if a disconnected peripheral throws on one of them.
+    check(#errors == 0, table.concat(errors, "; "))
+  end
+  function H.low() outputs(false) end
   local function cells(inv)
     local items = inv.list(); check(type(items) == "table", "Inventory unavailable")
     local count, slot, item = 0
@@ -281,7 +320,7 @@ local function hardware(cfg, log)
   end
   function H.localCell()
     local a = cells(port); local b = cells(vault)
-    check(a+b <= 1, "Multiple local spatial cells; use one cell per pool")
+    check(a+b <= 1, "There must be only one shared spatial cell")
     return a+b
   end
   local function inputOutput()
@@ -292,7 +331,8 @@ local function hardware(cfg, log)
     for _, name in ipairs(peripheral.getNames()) do
       if methods(name, {"getOwner","getItems","addItemToPlayer","removeItemFromPlayer"}) then
         local p = peripheral.wrap(name)
-        if p.getOwner() == player then
+        local ok, owner = pcall(p.getOwner)
+        if ok and owner == player then
           local t = sides[name] and direct or wired; t[#t+1] = p
         end
       end
@@ -313,28 +353,18 @@ local function hardware(cfg, log)
     return count, slot, p
   end
   function H.players()
-    local v = detector.getPlayersInCoords(cfg.ZONE_MIN, cfg.ZONE_MAX)
+    local v = detector.getPlayersInCoords(minimum, maximum)
     check(type(v) == "table", "Player detector unavailable")
     local out = {}
     for k, x in pairs(v) do
       local name = type(x) == "string" and x or type(x) == "table" and (x.name or x.username or x.player)
       if not name and type(k) == "string" then name = k end
-      if name then
-        local p = detector.getPlayerPos(name)
-        check(type(p) == "table" and type(p.dimension) == "string", "Cannot verify zone player's dimension")
-        if p.dimension == cfg.DIMENSION then out[#out+1] = name end
-      end
+      if name then out[#out+1] = name end
     end
     table.sort(out); return out
   end
-  local function pos(player)
-    local p = detector.getPlayerPos(player)
-    check(type(p) == "table" and type(p.dimension) == "string", "Player position unavailable; check online status and multidimensional detector config")
-    return p
-  end
   local function alone(player)
     local p = H.players(); check(#p == 1 and p[1] == player, "Source zone must contain only " .. player)
-    check(pos(player).dimension == cfg.DIMENSION, "Wrong source DIMENSION setting")
   end
   local function empty() check(#H.players() == 0, "Spatial zone occupied") end
   local function toVault()
@@ -362,8 +392,8 @@ local function hardware(cfg, log)
     check(localCount + count <= 1, "Cell ambiguity between player and local inventories")
     if localCount == 0 then
       check(count == 1 and slot ~= nil, "Cell not found locally or on player")
-      p.removeItemFromPlayer(cfg.MANAGER_SIDE, {name=cfg.CELL,fromSlot=slot,count=1})
-      check(H.localCell() == 1 and playerCells(j.player) == 0, "Player -> vault transfer failed; check MANAGER_SIDE")
+      p.removeItemFromPlayer("up", {name=cfg.CELL,fromSlot=slot,count=1})
+      check(H.localCell() == 1 and playerCells(j.player) == 0, "Player -> vault transfer failed; vault must be above manager")
     end
   end
   function H.reserve(j, id)
@@ -378,18 +408,18 @@ local function hardware(cfg, log)
     end
     if id == j.dst then empty() end
     if id == j.holder then check(cells(vault) == 1, "Advertised cell is no longer in holder vault")
-    else check(H.localCell() == 0, "Unexpected second cell in this pool") end
+    else check(H.localCell() == 0, "Unexpected second spatial cell") end
   end
   function H.give(j, commit)
     local n = H.localCell(); local carried, _, p = playerCells(j.player)
     if n == 0 then check(carried == 1, "Cell disappeared during handoff"); return end
     check(carried == 0, "Player already carries a spatial cell")
     toVault(); local _, slot = cells(vault)
-    p.addItemToPlayer(cfg.MANAGER_SIDE, {name=cfg.CELL,fromSlot=slot,count=1})
+    p.addItemToPlayer("up", {name=cfg.CELL,fromSlot=slot,count=1})
     check(H.localCell() == 0 and playerCells(j.player) == 1, "Vault -> player transfer failed")
   end
   function H.acquire(j, commit, destination)
-    if destination then empty(); check(pos(j.player).dimension == cfg.SPATIAL_DIMENSION, "Player is not in spatial dimension")
+    if destination then empty()
     else alone(j.player) end
     collect(j); toVault(); toInput(j, commit)
   end
@@ -418,33 +448,49 @@ local function hardware(cfg, log)
     check(a and a.name == cfg.CELL and a.count == 1 and not b, "Expected cell in input and empty output")
     check(j.cellNbt == a.nbt, "Input cell NBT changed unexpectedly")
     if kind == "capture" then alone(j.player)
-    else empty(); check(pos(j.player).dimension == cfg.SPATIAL_DIMENSION, "Player is no longer in spatial dimension") end
+    else empty() end
     H.low()
     j.pulses[kind] = {stage="INTENT", at=os.epoch("utc")}; commit()
     local ok, err = pcall(function()
-      relay.setOutput(cfg.RELAY_SIDE, true); sleep(cfg.PULSE_SECONDS)
+      outputs(true)
+      -- Sample immediately and during the pulse to retain evidence of a quick exit.
+      local untilLow = os.clock() + cfg.PULSE_SECONDS
+      repeat
+        H.reconcile(j, commit)
+        if kind ~= "capture" then H.observeArrival(j, commit) end
+        if os.clock() >= untilLow then break end
+        sleep(math.min(0.05, untilLow-os.clock()))
+      until false
     end)
     local lowOK, lowErr = pcall(H.low)
     check(ok and lowOK, tostring(err or lowErr))
     local deadline = os.clock()+8
     repeat
       H.reconcile(j, commit)
+      if kind ~= "capture" then H.observeArrival(j, commit) end
       if j.pulses[kind].stage == "APPLIED" then return end
       sleep(0.1)
     until os.clock() >= deadline
     -- The input staying in slot 1 is deliberately not treated as proof of a completed exchange.
     error("PULSE_UNCERTAIN: no verified output cell; inspect power/port without clearing state", 0)
   end
+  function H.observeArrival(j, commit)
+    local field = j.rolledBack and "returned" or j.released and "arrived" or nil
+    if field and not j[field] and contains(H.players(), j.player) then
+      j[field] = true; commit()
+    end
+  end
   function H.settle(j, commit)
+    check(j.released or j.rolledBack, "No confirmed release/rollback pulse")
+    local field = j.rolledBack and "returned" or "arrived"
     local deadline = os.clock()+12
     repeat
-      local ok, p = pcall(pos, j.player)
-      if ok and p.dimension ~= cfg.SPATIAL_DIMENSION then
-        j.arrivalDimension = p.dimension; j.arrived = true; commit(); toVault(); return
-      end
-      sleep(0.25)
+      if j[field] then toVault(); return end
+      H.observeArrival(j, commit)
+      if j[field] then toVault(); return end
+      sleep(0.1)
     until os.clock() >= deadline
-    error("Waiting to confirm player outside spatial dimension", 0)
+    error("Waiting to detect " .. j.player .. " in this station's zone; pulse will NOT be repeated", 0)
   end
   function H.repatriate(j, commit)
     if H.localCell() == 1 then H.give(j, commit) end
@@ -453,29 +499,32 @@ local function hardware(cfg, log)
     if j.rolledBack then H.settle(j, commit); return {returned=true} end
     collect(j)
     if j.captured then
-      local p = pos(j.player)
-      if p.dimension == cfg.SPATIAL_DIMENSION then
+      if not j.returned and contains(H.players(), j.player) then
+        -- Player already returned to the source. Do not capture them again.
+        j.returned = true; commit()
+      end
+      if not j.returned then
         empty(); toVault(); toInput(j, commit); H.pulse(j, "rollback", commit); H.settle(j, commit)
       else
-        j.escaped = true; commit(); toVault()
+        toVault()
       end
     else toVault() end
-    return {returned=j.rolledBack or false, escaped=j.escaped or false}
+    return {returned=j.returned or false}
   end
   H.low()
   return H
 end
 
 
-if _G.SPATIAL_TEST then return {Hub=Hub, hardware=hardware, journal=journal, checksum=checksum} end
+if _G.SPATIAL_TEST then return {Hub=Hub, hardware=hardware, journal=journal, checksum=checksum,
+  upgradeHubState=upgradeHubState, upgradeDispatcherState=upgradeDispatcherState} end
 check(CFG.CONFIGURED, "Edit the CFG block, then set CONFIGURED=true. Read README_RU.md first.")
 check(type(CFG.DISPATCHER_ID) == "number" and CFG.DISPATCHER_ID >= 0, "Set DISPATCHER_ID")
 check(CFG.HUB_ID ~= "" and CFG.HUB_ID ~= "dispatcher", "Set unique HUB_ID")
 local log = logger(CFG.LOG)
 local state, writer, damaged = journal(CFG.STATE)
 if not state then legacyGuard("hub_state.txt", true) end
-local identity = CFG.NETWORK .. ":" .. CFG.POOL .. ":" .. CFG.HUB_ID .. ":" .. CFG.DISPATCHER_ID
-if state then check(state.identity == identity, "Endpoint identity changed; restore original settings") end
+local identity = upgradeHubState(state, CFG.NETWORK, CFG.HUB_ID, CFG.DISPATCHER_ID)
 local diskFailed = false
 local function persist(v)
   local ok, err = pcall(writer, v)
@@ -487,9 +536,9 @@ local function send(cmd, data)
   local ok, result = pcall(rednet.send, CFG.DISPATCHER_ID, m, PROTOCOL)
   if not ok or not result then log("TX unavailable: " .. cmd .. " " .. tostring(result)) end
 end
-local h = Hub.new({id=CFG.HUB_ID, pool=CFG.POOL, now=function() return os.epoch("utc")/1000 end,
+local h = Hub.new({id=CFG.HUB_ID, now=function() return os.epoch("utc")/1000 end,
   persist=persist, persistFailed=function() return diskFailed end, send=send, hw=hw, log=log}, state)
-h.s.identity = identity; h:save()
+h.s.identity = identity; h.s.layout = "single_cell_zone_v1"; h:save()
 if damaged then log("Loaded previous valid journal generation; no automatic repeat pulses") end
 openModems()
 for key, name in pairs(hw.names) do print(key .. ": " .. name) end
@@ -546,7 +595,7 @@ local function heartbeat()
     local okCell, cell = pcall(hw.localCell)
     local okPlayers, players = pcall(hw.players)
     local fault = not okCell and tostring(cell) or not okPlayers and tostring(players) or nil
-    send("HELLO", {label=CFG.HUB_LABEL,pool=CFG.POOL,cell=okCell and cell or -1,
+    send("HELLO", {label=CFG.HUB_LABEL,cell=okCell and cell or -1,
       busy=h.s.active ~= nil,occupied=not okPlayers or #players > 0,fault=fault})
     enqueue({cmd="TICK"}); sleep(2)
   end
@@ -573,7 +622,7 @@ local function ui()
       currentPlayer = players[1]
       lines[#lines+1] = "Player: " .. currentPlayer; lines[#lines+1] = "Choose destination"
       for _, hub in ipairs(hubs) do
-        if hub.pool == CFG.POOL and hub.id ~= CFG.HUB_ID and not hub.busy and not hub.occupied and not hub.fault then choices[#choices+1] = hub end
+        if hub.id ~= CFG.HUB_ID and not hub.busy and not hub.occupied and not hub.fault then choices[#choices+1] = hub end
       end
       local w, height = monitor.getSize()
       local pageSize = math.max(1, math.min(10, height-6))
