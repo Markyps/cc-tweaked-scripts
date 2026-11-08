@@ -1,6 +1,6 @@
--- Spatial Dispatcher v2. One physical cell per POOL; independent pools can operate concurrently.
+-- Spatial Dispatcher v2.1. One shared physical cell for ALL endpoints.
 local CFG = {NETWORK="spatial_main", STATE="spatial_dispatcher_v2_state", LOG="spatial_dispatcher_v2.log"}
-local PROTOCOL = "spatial_hub_v2"
+local PROTOCOL = "spatial_hub_v2_1"
 
 
 -- Shared helpers are embedded in both deliverables; no extra library is required.
@@ -84,6 +84,28 @@ local function legacyGuard(path, hub)
   check(hub and v.phase == "IDLE" or not hub and not v.locked,
     "Unfinished v1 operation in " .. path .. ". Recover the player/cell with v1 before migration.")
 end
+local function upgradeHubState(state, network, hub, dispatcher)
+  local identity = network .. ":" .. hub .. ":" .. dispatcher
+  if not state then return identity end
+  if state.layout == "single_cell_zone_v1" then
+    check(state.identity == identity, "Endpoint identity changed; restore original settings")
+  else
+    local prefix, suffix = network .. ":", ":" .. hub .. ":" .. dispatcher
+    local old = state.identity or ""
+    check(old == identity or (old:sub(1,#prefix) == prefix and old:sub(-#suffix) == suffix), "Endpoint identity changed")
+    check(not state.active and not state.request, "Finish the v2 operation before upgrading to v2.1")
+    for _, j in pairs(state.ops or {}) do check(j.closed, "Unfinished v2 endpoint operation") end
+  end
+  return identity
+end
+local function upgradeDispatcherState(state)
+  if state and state.layout ~= "single_cell_zone_v1" then
+    for _, t in pairs(state.ops or {}) do
+      check(t.phase == "CLOSED", "Finish all v2 operations before upgrading to v2.1")
+      t.pool = nil -- Retire the old journal field only after the operation has ended.
+    end
+  end
+end
 
 
 local Dispatcher = {}
@@ -96,10 +118,10 @@ function Dispatcher.new(io, state)
 end
 function Dispatcher:save() self.io.persist(self.s) end
 function Dispatcher:emit(to, cmd, data) self.io.send(to, cmd, data or {}) end
-function Dispatcher:locked(pool, hub, player)
+function Dispatcher:locked(hub)
   for _, t in pairs(self.s.ops) do
     if t.phase ~= "CLOSED" then
-      if t.phase ~= "CLOSING" and (t.pool == pool or t.player == player) then return true end
+      if t.phase ~= "CLOSING" then return true end -- The only physical cell is still in use.
       if contains(t.members, hub) and not (t.finished and t.finished[hub]) then return true end
     end
   end
@@ -117,13 +139,13 @@ function Dispatcher:command(t, to, action)
   if self.sent[k] and self.io.now() - self.sent[k] < 2 then return end
   self.sent[k] = self.io.now()
   self:emit(to, "COMMAND", {op=t.op, request=t.request, action=action, src=t.src, dst=t.dst,
-    holder=t.holder, player=t.player, pool=t.pool, outcome=t.outcome,
+    holder=t.holder, player=t.player, outcome=t.outcome,
     expires=t.expires, reason=t.reason})
 end
 function Dispatcher:close(t, outcome)
   t.phase, t.outcome, t.finished = "CLOSING", outcome, {}
   t.closedAt = self.io.now(); self:save()
-  self.io.log("op=" .. t.op .. " physical result=" .. outcome .. "; pool released, endpoint cleanup pending")
+  self.io.log("op=" .. t.op .. " physical result=" .. outcome .. "; shared cell released, endpoint cleanup pending")
 end
 function Dispatcher:abort(t, reason)
   if t.phase ~= "RUNNING" then return end
@@ -137,13 +159,13 @@ function Dispatcher:receive(sender, m)
   if type(m) ~= "table" or type(m.from) ~= "string" then return end
   local from = m.from
   if m.cmd == "HELLO" then
-    if type(m.pool) ~= "string" or type(m.label) ~= "string" then return end
+    if type(m.label) ~= "string" then return end
     if self.s.pins[from] and self.s.pins[from] ~= sender then
       if self.hubs[from] then self.hubs[from].conflict = true end
       self.io.log("Duplicate hub ID " .. from .. " from computer " .. tostring(sender)); return
     end
     if not self.s.pins[from] then self.s.pins[from] = sender; self:save() end
-    self.hubs[from] = {seen=self.io.now(), sender=sender, pool=m.pool, label=m.label,
+    self.hubs[from] = {seen=self.io.now(), sender=sender, label=m.label,
       cell=m.cell, busy=m.busy, occupied=m.occupied, fault=m.fault}
     return
   end
@@ -166,21 +188,22 @@ function Dispatcher:receive(sender, m)
     if from == m.dst or not self:fresh(from) or not self:fresh(m.dst) then
       self:reject(from, m.request, "ENDPOINT_OFFLINE"); return
     end
-    if src.pool ~= dst.pool then self:reject(from, m.request, "DIFFERENT_CELL_POOLS"); return end
-    if self:locked(src.pool, from, m.player) or self:locked(src.pool, m.dst, m.player) or src.busy or dst.busy or dst.occupied or src.fault or dst.fault then
+    if self:locked(from) or self:locked(m.dst) or src.busy or dst.busy or dst.occupied or src.fault or dst.fault then
       self:reject(from, m.request, "RESOURCE_BUSY"); return
     end
     local owners = {}
     for id, h in pairs(self.hubs) do
-      if h.pool == src.pool and self:fresh(id) and h.cell == 1 and not h.busy and not h.fault and not self:locked(src.pool, id, m.player) then owners[#owners+1] = id end
-      if h.pool == src.pool and self:fresh(id) and type(h.cell) == "number" and h.cell > 1 then
-        self:reject(from, m.request, "MULTIPLE_CELLS_IN_POOL"); return
+      if self:fresh(id) and h.cell == 1 then owners[#owners+1] = id end
+      if self:fresh(id) and type(h.cell) == "number" and h.cell > 1 then
+        self:reject(from, m.request, "MULTIPLE_SPATIAL_CELLS"); return
       end
     end
-    if #owners ~= 1 then self:reject(from, m.request, #owners == 0 and "CELL_NOT_LOCATED" or "MULTIPLE_CELLS_IN_POOL"); return end
+    if #owners ~= 1 then self:reject(from, m.request, #owners == 0 and "CELL_NOT_LOCATED" or "MULTIPLE_SPATIAL_CELLS"); return end
+    local holder = self.hubs[owners[1]]
+    if holder.busy or holder.fault or self:locked(owners[1]) then self:reject(from, m.request, "CELL_HOLDER_BUSY"); return end
     self.s.counter = self.s.counter + 1
     local t = {op=tostring(self.io.id) .. ":" .. self.s.counter, request=m.request, src=from, dst=m.dst,
-      player=m.player, holder=owners[1], pool=src.pool, phase="RUNNING", index=1, mutated={},
+      player=m.player, holder=owners[1], phase="RUNNING", index=1, mutated={},
       expires=self.io.now()+300, started=self.io.now(), stepAt=self.io.now()}
     t.members = unique({t.src, t.dst, t.holder}); t.plan = {}
     for _, id in ipairs(t.members) do t.plan[#t.plan+1] = {to=id, action="RESERVE"} end
@@ -219,7 +242,7 @@ function Dispatcher:receive(sender, m)
     if m.ok then t.returnIndex = t.returnIndex + 1; self:save() end
   elseif t.phase == "RESTORING" and m.action == "RESTORE" and from == t.src then
     if m.ok then
-      self:close(t, m.data and m.data.escaped and "PLAYER_SAFE" or (t.fenced[t.src].captured and "ROLLED_BACK" or "CANCELLED"))
+      self:close(t, t.fenced[t.src].captured and "ROLLED_BACK" or "CANCELLED")
     end
   elseif t.phase == "SETTLING" and m.action == "SETTLE" and from == t.dst then
     if m.ok then self:close(t, "DONE") end
@@ -290,6 +313,7 @@ local state, persist, damaged = journal(CFG.STATE)
 if not state then legacyGuard("dispatcher_state.txt", false) end
 local id = os.getComputerID()
 if state then check(state.identity == CFG.NETWORK .. ":" .. id, "Dispatcher identity changed; keep original ID and NETWORK") end
+upgradeDispatcherState(state)
 local d
 local function send(to, cmd, data)
   local m = copy(data); m.cmd, m.from, m.to, m.network = cmd, "dispatcher", to, CFG.NETWORK
@@ -301,19 +325,19 @@ local function send(to, cmd, data)
 end
 d = Dispatcher.new({id=id, now=function() return os.epoch("utc")/1000 end,
   persist=persist, send=send, log=log}, state)
-d.s.identity = CFG.NETWORK .. ":" .. id; d:save()
+d.s.identity = CFG.NETWORK .. ":" .. id; d.s.layout = "single_cell_zone_v1"; d:save()
 if damaged then log("Recovered previous valid journal generation; reconciling operations") end
 openModems()
 local lastList, lastDisplay = -100, -100
 local function show()
   term.setCursorPos(1,1); term.clear()
-  print("Spatial dispatcher v2 | ID " .. id)
+  print("Spatial dispatcher v2.1 | ID " .. id)
   print("Network: " .. CFG.NETWORK)
   local total = 0
   for _, t in pairs(d.s.ops) do
     if t.phase ~= "CLOSED" then
       total = total + 1
-      print(t.pool .. " " .. t.op .. " " .. t.phase)
+      print(t.op .. " " .. t.phase)
       print("  " .. t.src .. " -> " .. t.dst .. " / " .. t.player)
       if t.reason then print("  " .. t.reason) end
       if t.recoveryError then print("  " .. t.recoveryError) end
@@ -332,7 +356,7 @@ while true do
     pcall(openModems) -- Reopen a modem reattached while the dispatcher was running.
     local list = {}
     for hub, h in pairs(d.hubs) do
-      if d:fresh(hub) then list[#list+1] = {id=hub,label=h.label,pool=h.pool,busy=h.busy,occupied=h.occupied,fault=h.fault} end
+      if d:fresh(hub) then list[#list+1] = {id=hub,label=h.label,busy=h.busy,occupied=h.occupied,fault=h.fault} end
     end
     table.sort(list, function(a,b) return a.label:lower() < b.label:lower() end)
     for hub in pairs(d.hubs) do if d:fresh(hub) then send(hub, "HUB_LIST", {hubs=list}) end end
